@@ -1,0 +1,12 @@
+{
+  "assistant_id": "agent",
+  "input": {
+    "messages": [
+      {
+        "type": "human", 
+        "content": "Hello! Can you help me understand what LangGraph is?"
+      }
+    ]
+  },
+  "stream_mode": ["values", "updates"]
+}

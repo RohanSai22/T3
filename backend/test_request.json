@@ -1,0 +1,11 @@
+{
+  "assistant_id": "agent",
+  "input": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello! Can you search for information about artificial intelligence trends in 2025?"
+      }
+    ]
+  }
+}

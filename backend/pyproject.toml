@@ -7,23 +7,23 @@ readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11,<4.0"
 dependencies = [
-    "langgraph>=0.2.6",
+    "langgraph>=0.4.8",
     "langchain>=0.3.19",
-    "langchain-google-genai==2.1.5",     # Pinned
+    "langchain-google-genai==2.1.5",
     "python-dotenv>=1.0.1",
     "langgraph-sdk>=0.1.57",
     "langgraph-cli",
     "langgraph-api",
     "fastapi",
-    "google-genai",
-    "googlesearch-python>=1.0.1,<2.0.0", # Google search functionality
-    "beautifulsoup4>=4.12.0",            # HTML parsing
-    "requests>=2.31.0",                  # HTTP requests
-    "spacy>=3.7.0",                      # NLP for content analysis
-    "e2b-code-interpreter==1.5.1",       # Pinned
-    "yfinance>=0.2.0,<1.0.0",
-    "protobuf==5.29.5",                  # Pinned to resolve conflict
-    # Consider pinning google-api-core and grpcio-status if issues persist
+    "google-generativeai",
+    "googlesearch-python>=1.0.1,<2.0.0",
+    "beautifulsoup4>=4.12.0",
+    "requests>=2.31.0",
+    "spacy>=3.7.0",
+    "e2b-code-interpreter==1.5.1",
+    "yfinance>=0.2.0",
+    "pandas>=2.0.0",
+    "protobuf==5.29.5"
 ]
 
 

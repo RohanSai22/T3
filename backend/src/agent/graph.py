@@ -239,9 +239,10 @@ def generate_query(state: OverallState, config: RunnableConfig) -> dict:
     # For this call, we'll use the value from the config object.
 
     # init Gemini Flash
-    llm = ChatGoogleGenerativeAI(
-        model=configurable.query_generator_model,
-        temperature=1.0,
+    try:
+        llm = ChatGoogleGenerativeAI(
+            model=configurable.query_generator_model,
+            temperature=1.0,
         max_retries=2,
         api_key=os.getenv("GEMINI_API_KEY"),
     )
@@ -251,17 +252,19 @@ def generate_query(state: OverallState, config: RunnableConfig) -> dict:
     current_date = get_current_date()
     formatted_prompt = query_writer_instructions.format(
         current_date=current_date,
-        research_topic=get_research_topic(state["messages"]),
+        research_topic=get_research_topic(state.get("messages", [])), # Use .get()
         number_queries=configurable.number_of_initial_queries,
     )
     # Generate the search queries
     result = structured_llm.invoke(formatted_prompt)
 
-    query_list_details = [f"{i+1}. {q}" for i, q in enumerate(result.query)] if result.query else ["No queries generated."]
-    yield {"event_type": "thought", "data": create_thought_event("Action", f"Generated {len(result.query)} initial search queries.", query_list_details)}
+    generated_queries = result.query if result and hasattr(result, 'query') else []
+
+    query_list_details = [f"{i+1}. {q}" for i, q in enumerate(generated_queries)] if generated_queries else ["No queries generated."]
+    yield {"event_type": "thought", "data": create_thought_event("Action", f"Generated {len(generated_queries)} initial search queries.", query_list_details)}
 
     return {
-        "query_list": result.query,
+        "query_list": generated_queries,
         # Also pass research_effort from config to state, if not already there,
         # as it's needed by routing logic later.
         "research_effort": configurable.research_effort.value, # Pass enum's value (string)
@@ -270,6 +273,18 @@ def generate_query(state: OverallState, config: RunnableConfig) -> dict:
         "research_loop_count": 0, # Initialize loop counter
         "current_goal": "Initial queries generated. Starting web research."
     }
+    except Exception as e:
+        error_message = f"Error in generate_query: {str(e)}"
+        print(error_message)
+        yield {"event_type": "thought", "data": create_thought_event("Error", "Query Generation Failed", error_message)}
+        return { # Return a valid state update with error indication
+            "query_list": [],
+            "research_effort": state.get("research_effort", ResearchEffort.NORMAL.value), # Keep existing or default
+            "max_research_loops": state.get("max_research_loops", 1),
+            "initial_search_query_count": 0,
+            "research_loop_count": 0,
+            "current_goal": "Failed to generate initial queries."
+        }
 
 
 def continue_to_web_research(state: dict): # state type here is from the output of generate_query (QueryGenerationState is too narrow now)
@@ -287,40 +302,63 @@ def continue_to_web_research(state: dict): # state type here is from the output 
 
 def web_research(state: WebSearchState, config: RunnableConfig) -> dict:
     """LangGraph node that performs web research. Yields thoughts."""
-    # WebSearchState has 'search_query: str' and 'id: str' (actually int from Send)
-    search_query = state["search_query"]
+    search_query = state.get("search_query", "") # Use .get()
+    node_id = state.get("id", "unknown_id") # Use .get()
 
-    yield {"event_type": "thought", "data": create_thought_event("Action", "Performing Web Search", f"Executing search for query: \"{search_query}\"")}
+    if not search_query:
+        yield {"event_type": "thought", "data": create_thought_event("Error", "Web Search Skipped", "No search query provided.")}
+        return {
+            "sources_gathered": [],
+            "search_query": [""],
+            "web_research_result": ["Error: No search query provided."],
+            "url_to_citation_marker": state.get("url_to_citation_marker", {}),
+            "next_citation_index": state.get("next_citation_index", 1),
+            "current_goal": "Web search skipped due to missing query."
+        }
+
+    yield {"event_type": "thought", "data": create_thought_event("Action", "Performing Web Search", f"Executing search for query: \"{search_query}\" (ID: {node_id})")}
 
     configurable = Configuration.from_runnable_config(config)
-    formatted_prompt = web_searcher_instructions.format(
-        current_date=get_current_date(),
-        research_topic=search_query,
-    )
 
-    # Uses the google genai client
-    response = genai_client.models.generate_content(
-        model=configurable.query_generator_model,
-        contents=formatted_prompt,
-        config={
-            "tools": [{"google_search": {}}],
-            "temperature": 0,
-        },
-    )
+    # Initialize return fields
+    combined_sources = []
+    combined_snippets = []
+    updated_marker_map = state.get("url_to_citation_marker", {})
+    new_next_idx = state.get("next_citation_index", 1)
 
-    # Initialize or retrieve citation mapping state
-    url_to_marker_map = state.get("url_to_citation_marker") or {}
-    current_next_idx = state.get("next_citation_index") or 1
+    try:
+        formatted_prompt = web_searcher_instructions.format(
+            current_date=get_current_date(),
+            research_topic=search_query,
+        )
 
-    # Get citations, updated map, next index, and sources for this specific response
-    textual_citations, updated_marker_map, new_next_idx, sources_for_this_call = get_citations_from_response(
-        response,
-        url_to_marker_map,
-        current_next_idx
-    )
+        # Uses the google genai client
+        response = genai_client.models.generate_content(
+            model=configurable.query_generator_model,
+            contents=formatted_prompt,
+            config={
+                "tools": [{"google_search": {}}],
+                "temperature": 0,
+            },
+        )
 
-    # Insert citation markers ("[1]", "[2]", etc.) into the response text
-    modified_text_genai = insert_citation_markers(response.text, textual_citations)
+        # Get citations, updated map, next index, and sources for this specific response
+        textual_citations, updated_marker_map, new_next_idx, sources_for_this_call = get_citations_from_response(
+            response,
+            updated_marker_map, # Pass current map
+            new_next_idx # Pass current index
+        )
+
+        # Insert citation markers ("[1]", "[2]", etc.) into the response text
+        modified_text_genai = insert_citation_markers(response.text, textual_citations)
+        combined_sources.extend(sources_for_this_call)
+        combined_snippets.append(modified_text_genai)
+
+    except Exception as e:
+        error_msg = f"Error during Google Search API call for query '{search_query}': {str(e)}"
+        print(error_msg)
+        combined_snippets.append(f"Google Search API error for query '{search_query}': {error_msg}")
+        yield {"event_type": "thought", "data": create_thought_event("Error", "Google Search API Error", error_msg)}
 
     # sources_for_this_call now contains dicts like {'title': ..., 'url': ..., 'short_url': '[1]'}
     # This will be added to the overall sources_gathered in the state.
@@ -334,71 +372,75 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> dict:
         yield {"event_type": "thought", "data": create_thought_event("Action", "Enhanced Google Search", f"Performing additional Google search with web scraping for: \"{search_query}\"")}
         
         # Get search results using googlesearch-python
-        search_urls = list(google_search_lib(search_query, num_results=20, lang="en", sleep_interval=2.0))
+        search_urls = list(google_search_lib(search_query, num_results=20, lang="en", sleep_interval=2.0)) # Consider making num_results configurable
         
         if search_urls:
             # Filter and scrape top URLs
-            top_webpages = get_top_k_webpages_info(search_urls, search_query, k=3)
+            # Ensure k is configurable or a sensible default
+            k_scrape = configurable.max_sources_per_query if hasattr(configurable, 'max_sources_per_query') else 3
+            top_webpages = get_top_k_webpages_info(search_urls, search_query, k=k_scrape)
             
+            scraped_count = 0
             for i, webpage_data in enumerate(top_webpages):
-                if webpage_data['status'] == 'success':
+                if webpage_data.get('status') == 'success': # Use .get()
+                    scraped_count +=1
                     # Create citation marker for this source
-                    citation_key = f"gs_{state['id']}_{i}"
+                    citation_key = f"gs_{node_id}_{i}" # Use node_id
                     
                     # Add to citation mapping
-                    if webpage_data['url'] not in updated_marker_map:
+                    if webpage_data.get('url') not in updated_marker_map: # Use .get()
                         citation_marker = f"[{new_next_idx}]"
-                        updated_marker_map[webpage_data['url']] = citation_marker
+                        updated_marker_map[webpage_data.get('url')] = citation_marker # Use .get()
                         new_next_idx += 1
                     else:
-                        citation_marker = updated_marker_map[webpage_data['url']]
+                        citation_marker = updated_marker_map.get(webpage_data.get('url')) # Use .get()
                     
                     # Create source entry
                     source_entry = {
-                        'title': webpage_data['title'],
-                        'url': webpage_data['url'],
+                        'title': webpage_data.get('title', 'No Title'), # Use .get()
+                        'url': webpage_data.get('url'),
                         'citation_marker': citation_marker,
                         'segment_id': citation_key
                     }
-                    additional_sources.append(source_entry)
+                    combined_sources.append(source_entry) # Append to combined_sources directly
                     
                     # Create content snippet with citation
-                    content_snippet = f"Title: {webpage_data['title']}\n"
-                    content_snippet += f"Content: {webpage_data['content']}\n"
-                    content_snippet += f"Source: {citation_marker} {webpage_data['url']}"
-                    additional_snippets.append(content_snippet)
+                    content_snippet = f"Title: {webpage_data.get('title', 'No Title')}\n" # Use .get()
+                    content_snippet += f"Content: {webpage_data.get('content', '')}\n" # Use .get()
+                    content_snippet += f"Source: {citation_marker} {webpage_data.get('url')}"
+                    combined_snippets.append(content_snippet) # Append to combined_snippets
             
-            scraped_count = len(top_webpages)
-            yield {"event_type": "thought", "data": create_thought_event("Analysis", "Web Scraping Complete", f"Successfully scraped {scraped_count} additional sources with content extraction and relevance filtering.")}
-        
-    except Exception as e:
-        error_msg = f"Error during enhanced Google search: {str(e)}"
-        print(error_msg)
-        additional_snippets.append(f"Enhanced search error for query '{search_query}': {error_msg}")
-        yield {"event_type": "thought", "data": create_thought_event("Error", "Enhanced Search Error", error_msg)}
+            yield {"event_type": "thought", "data": create_thought_event("Analysis", "Web Scraping Complete", f"Successfully processed {scraped_count} additional sources with content extraction and relevance filtering.")}
+        else:
+            yield {"event_type": "thought", "data": create_thought_event("Analysis", "Enhanced Google Search", "No URLs found from google_search_lib to scrape.")}
 
-    # Combine results from both search methods
-    combined_sources = sources_for_this_call + additional_sources
-    combined_snippets = [modified_text_genai] + additional_snippets
+    except Exception as e:
+        error_msg = f"Error during enhanced Google search/scraping for query '{search_query}': {str(e)}"
+        print(error_msg)
+        combined_snippets.append(f"Enhanced search/scraping error for query '{search_query}': {error_msg}") # Add to combined_snippets
+        yield {"event_type": "thought", "data": create_thought_event("Error", "Enhanced Search/Scraping Error", error_msg)}
 
     # Update the state with the combined results from both search methods
-    all_source_titles = [src.get('title', 'Unknown title') for src in combined_sources]
+    all_source_titles = [src.get('title', 'Unknown title') for src in combined_sources] # Use combined_sources
     details_text = f"Received {len(all_source_titles)} total search result snippets from multiple sources."
     # Limiting details to avoid excessive data in thought:
     if all_source_titles:
         details_text += " Example titles: " + ", ".join(all_source_titles[:3])
         if len(all_source_titles) > 3:
             details_text += "..."
+    else:
+        details_text = "No search results or snippets gathered."
+
 
     yield {"event_type": "thought", "data": create_thought_event("Analysis", f"Complete Web Search Results Analysis", f"Final analysis of all results for query \"{search_query}\". {details_text}")}
 
     return {
-        "sources_gathered": combined_sources,
-        "search_query": [search_query],
-        "web_research_result": combined_snippets,
+        "sources_gathered": combined_sources, # Use combined_sources
+        "search_query": [search_query], # search_query is a string, ensure it's in a list if OverallState expects list
+        "web_research_result": combined_snippets, # Use combined_snippets
         "url_to_citation_marker": updated_marker_map,
         "next_citation_index": new_next_idx,
-        "current_goal": f"Enhanced web search for \"{search_query}\" complete with content extraction. Reflecting on findings."
+        "current_goal": f"Enhanced web search for \"{search_query}\" complete. Reflecting on findings."
     }
 
 
@@ -420,59 +462,83 @@ def reflection(state: OverallState, config: RunnableConfig) -> dict: # Return ty
     # The actual increment controlling max_loops happens in routing or by convention.
     # The original code: state["research_loop_count"] = state.get("research_loop_count", 0) + 1. This is a side effect.
     # Better to return the new value:
-    research_loop_count_for_this_reflection = current_loop_count + 1
+    research_loop_count_for_this_reflection = current_loop_count + 1 # This was already correct
+
+    try:
+        # Ensure reflection_model is used, not reasoning_model from a potentially outdated state key
+        reflection_model_name = configurable.reflection_model
+
+        # Format the prompt
+        current_date = get_current_date()
+        # Use .get() for state access
+        research_topic = get_research_topic(state.get("messages", []))
+        web_results = state.get("web_research_result", [])
+        summaries_str = "\n\n---\n\n".join(web_results) if web_results else "No web research results available."
+
+        formatted_prompt = reflection_instructions.format(
+            current_date=current_date,
+            research_topic=research_topic,
+            summaries=summaries_str,
+        )
+        # init Reasoning Model
+        llm = ChatGoogleGenerativeAI(
+            model=reflection_model_name,
+            temperature=1.0, # Consider if this should be configurable
+            max_retries=2,
+            api_key=os.getenv("GEMINI_API_KEY"),
+        )
+        result = llm.with_structured_output(Reflection).invoke(formatted_prompt)
+
+        is_sufficient = result.is_sufficient if hasattr(result, 'is_sufficient') else False
+        knowledge_gap = result.knowledge_gap if hasattr(result, 'knowledge_gap') else "No specific knowledge gap identified."
+        follow_up_queries = result.follow_up_queries if hasattr(result, 'follow_up_queries') else []
+        suggests_code_execution = result.suggests_code_execution if hasattr(result, 'suggests_code_execution') else False
 
 
-    # Ensure reflection_model is used, not reasoning_model from a potentially outdated state key
-    reflection_model_name = configurable.reflection_model
+        analysis_details = [
+            f"Is information sufficient? {'Yes' if is_sufficient else 'No'}.",
+            f"Identified knowledge gap: {knowledge_gap}"
+        ]
+        yield {"event_type": "thought", "data": create_thought_event("Analysis", "Reflection Results", analysis_details)}
 
-    # Format the prompt
-    current_date = get_current_date()
-    formatted_prompt = reflection_instructions.format(
-        current_date=current_date,
-        research_topic=get_research_topic(state["messages"]),
-        summaries="\n\n---\n\n".join(state["web_research_result"]),
-    )
-    # init Reasoning Model
-    llm = ChatGoogleGenerativeAI(
-        model=reflection_model_name,
-        temperature=1.0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
-    )
-    result = llm.with_structured_output(Reflection).invoke(formatted_prompt)
+        next_goal_for_state = "Next step determined based on reflection."
+        if suggests_code_execution and os.getenv("E2B_API_KEY"): # Check API key before suggesting goal
+            yield {"event_type": "thought", "data": create_thought_event("Strategy", "Code Execution Planned", "Planning to generate and execute code to address knowledge gap.")}
+            next_goal_for_state = "Proceeding to code generation and execution."
+        elif follow_up_queries:
+            query_details = [f"{i+1}. {q}" for i, q in enumerate(follow_up_queries)]
+            yield {"event_type": "thought", "data": create_thought_event("Action", f"Generated {len(follow_up_queries)} follow-up queries.", query_details)}
+            next_goal_for_state = "Proceeding with follow-up web research."
+        elif not is_sufficient:
+            next_goal_for_state = "Information still insufficient, but no clear follow-up. Moving to finalize."
+        else:
+            next_goal_for_state = "Information deemed sufficient. Finalizing answer."
 
-    knowledge_gap_details = result.knowledge_gap if result.knowledge_gap else "No specific knowledge gap identified."
-    analysis_details = [
-        f"Is information sufficient? {'Yes' if result.is_sufficient else 'No'}.",
-        f"Identified knowledge gap: {knowledge_gap_details}"
-    ]
-    yield {"event_type": "thought", "data": create_thought_event("Analysis", "Reflection Results", analysis_details)}
+        new_total_queries = state.get("number_of_ran_queries", 0) + len(follow_up_queries)
 
-    next_goal_for_state = "Next step determined based on reflection."
-    if result.suggests_code_execution and os.getenv("E2B_API_KEY"): # Check API key before suggesting goal
-        yield {"event_type": "thought", "data": create_thought_event("Strategy", "Code Execution Planned", "Planning to generate and execute code to address knowledge gap.")}
-        next_goal_for_state = "Proceeding to code generation and execution."
-    elif result.follow_up_queries:
-        query_details = [f"{i+1}. {q}" for i, q in enumerate(result.follow_up_queries)]
-        yield {"event_type": "thought", "data": create_thought_event("Action", f"Generated {len(result.follow_up_queries)} follow-up queries.", query_details)}
-        next_goal_for_state = "Proceeding with follow-up web research."
-    elif not result.is_sufficient:
-        next_goal_for_state = "Information still insufficient, but no clear follow-up. Moving to finalize."
-    else:
-        next_goal_for_state = "Information deemed sufficient. Finalizing answer."
-
-    new_total_queries = state.get("number_of_ran_queries", 0) + len(result.follow_up_queries)
-
-    return {
-        "is_sufficient": result.is_sufficient,
-        "knowledge_gap": result.knowledge_gap,
-        "follow_up_queries": result.follow_up_queries,
-        "research_loop_count": research_loop_count_for_this_reflection,
-        "suggests_code_execution": result.suggests_code_execution,
-        "number_of_ran_queries": new_total_queries,
-        "current_goal": next_goal_for_state
-    }
+        return {
+            "is_sufficient": is_sufficient,
+            "knowledge_gap": knowledge_gap,
+            "follow_up_queries": follow_up_queries,
+            "research_loop_count": research_loop_count_for_this_reflection,
+            "suggests_code_execution": suggests_code_execution,
+            "number_of_ran_queries": new_total_queries,
+            "current_goal": next_goal_for_state
+        }
+    except Exception as e:
+        error_message = f"Error in reflection: {str(e)}"
+        print(error_message)
+        yield {"event_type": "thought", "data": create_thought_event("Error", "Reflection Failed", error_message)}
+        # Return a state that likely leads to finalization on error
+        return {
+            "is_sufficient": True, # Assume sufficient to stop further loops on error
+            "knowledge_gap": "Error during reflection, unable to determine gap.",
+            "follow_up_queries": [],
+            "research_loop_count": research_loop_count_for_this_reflection, # Increment loop count
+            "suggests_code_execution": False,
+            "number_of_ran_queries": state.get("number_of_ran_queries", 0),
+            "current_goal": "Error during reflection. Proceeding to finalize."
+        }
 
 
 def evaluate_research(
@@ -549,21 +615,24 @@ def route_after_reflection(state: OverallState) -> List[Send] | str:
     # According to Configuration changes (Step 1 of previous task), research_effort is a field.
     # It's not added to OverallState in this task's Step 2. This needs to be reconciled.
     # I will assume research_effort IS in the state for now.
-    # If not, this condition `state.get("research_effort") == ResearchEffort.DEEP_RESEARCH` will fail.
+    # If not, this condition `state.get("research_effort") == ResearchEffort.DEEP_RESEARCH.value` will fail.
     # It was added to OverallState in a previous step.
     # We need to ensure that 'research_effort' in the state is populated from the Configuration
     # at the beginning of the graph execution or when configuration changes.
 
     # Check for E2B execution path
     should_execute_code = state.get("suggests_code_execution", False)
-    current_research_effort = state.get("research_effort")
+    current_research_effort = state.get("research_effort", ResearchEffort.NORMAL.value) # Default to NORMAL if not set
 
     if should_execute_code and current_research_effort == ResearchEffort.DEEP_RESEARCH.value:
         if not os.getenv("E2B_API_KEY"):
-            print("Warning: E2B_API_KEY not set. Skipping code execution path. Will proceed to web research if queries exist.")
-            # Fall through to web research or finalize
+            print("Warning: E2B_API_KEY not set. Skipping code execution path. Will proceed to web research if queries exist, or finalize.")
+            yield {"event_type": "thought", "data": create_thought_event("Warning", "E2B Execution Skipped", "E2B_API_KEY not set. Cannot execute code.")}
+            # Fall through to web research or finalize logic
         else:
-            return "execute_e2b_code"
+            # Yield thought before returning the node name string
+            yield {"event_type": "thought", "data": create_thought_event("Routing", "Proceeding to Code Execution", "Reflection suggests code execution, API key is available, and effort is Deep Research.")}
+            return "execute_e2b_code" # Correctly returns a string for the conditional edge
 
     follow_up_queries = state.get("follow_up_queries", [])
     if follow_up_queries:
@@ -605,10 +674,10 @@ def execute_e2b_code(state: OverallState, config: RunnableConfig) -> dict:
     )
     structured_llm = llm.with_structured_output(E2BCodeExecutionRequest)
 
-    research_topic = get_research_topic(state["messages"])
+    research_topic = get_research_topic(state.get("messages", [])) # .get()
     # Ensure summaries and knowledge_gap are strings and not None
-    summaries_str = "\n---\n\n".join(state.get("web_research_result") or [])
-    knowledge_gap_str = state.get("knowledge_gap") or "No specific knowledge gap identified, general request."
+    summaries_str = "\n---\n\n".join(state.get("web_research_result", []) or []) # .get() with default list
+    knowledge_gap_str = state.get("knowledge_gap", "No specific knowledge gap identified, general request.") # .get()
 
 
     prompt = e2b_code_generation_instructions.format(
@@ -620,111 +689,113 @@ def execute_e2b_code(state: OverallState, config: RunnableConfig) -> dict:
     try:
         llm_response = structured_llm.invoke(prompt)
 
-        if llm_response.type == "none" or not llm_response.code:
-            rationale = llm_response.rationale or "Code execution deemed not necessary or code is empty."
+        llm_code_type = getattr(llm_response, 'type', 'none')
+        llm_code = getattr(llm_response, 'code', '')
+        llm_dependencies = getattr(llm_response, 'dependencies', [])
+        llm_rationale = getattr(llm_response, 'rationale', '')
+
+
+        if llm_code_type == "none" or not llm_code:
+            rationale = llm_rationale or "Code execution deemed not necessary by LLM or code is empty."
             e2b_updates["e2b_stderr"].append(rationale)
-            yield {"event_type": "thought", "data": create_thought_event("Analysis", "Code Execution Skipped", rationale)}
+            yield {"event_type": "thought", "data": create_thought_event("Analysis", "Code Execution Skipped (LLM)", rationale)}
             e2b_updates["current_goal"] = "Skipped code execution based on LLM rationale. Reflecting again."
             return e2b_updates
 
-        e2b_updates["e2b_generated_code"] = llm_response.code
-        code_snippet = llm_response.code[:250] + "..." if len(llm_response.code) > 250 else llm_response.code
-        yield {"event_type": "thought", "data": create_thought_event("Action", f"Generated {llm_response.type} code for E2B execution.", code_snippet)}
+        e2b_updates["e2b_generated_code"] = llm_code
+        code_snippet = llm_code[:250] + "..." if len(llm_code) > 250 else llm_code
+        yield {"event_type": "thought", "data": create_thought_event("Action", f"Generated {llm_code_type} code for E2B execution.", code_snippet)}
 
+        # This check is technically redundant if route_after_reflection works correctly, but good for safety.
         if not os.getenv("E2B_API_KEY"):
-            error_msg = "E2B_API_KEY is not set. Cannot execute code."
+            error_msg = "E2B_API_KEY is not set. Cannot execute code. This should have been caught by routing logic."
             print(f"ERROR: {error_msg}")
             e2b_updates["e2b_stderr"].append(error_msg)
-            yield {"event_type": "thought", "data": create_thought_event("Error", "E2B API Key Missing", error_msg)}
+            yield {"event_type": "thought", "data": create_thought_event("Error", "E2B API Key Missing (Execution Node)", error_msg)}
             e2b_updates["current_goal"] = "E2B execution failed (API Key missing). Reflecting again."
             return e2b_updates
 
-        yield {"event_type": "thought", "data": create_thought_event("Action", "Executing Code in Sandbox", f"Running {llm_response.type} code in E2B sandbox.")}
-        with CodeInterpreter(api_key=os.getenv("E2B_API_KEY")) as sandbox:
-            if llm_response.type == "python":
-                if llm_response.dependencies:
-                    deps_str = ", ".join(llm_response.dependencies)
-                    yield {"event_type": "thought", "data": create_thought_event("Action", "Installing Dependencies", f"Installing: {deps_str}")}
-                    for dep in llm_response.dependencies:
-                        try:
-                            install_result = sandbox.notebook.install_pip_package(dep)
-                            if not install_result.success:
-                                err_detail = f"Failed to install dependency: {dep}. Error: {install_result.error}"
-                                e2b_updates["e2b_stderr"].append(err_detail)
-                                yield {"event_type": "thought", "data": create_thought_event("Error", "Dependency Installation Failed", err_detail)}
-                        except Exception as e_dep:
-                             err_detail = f"Exception during dependency installation {dep}: {str(e_dep)}"
-                             e2b_updates["e2b_stderr"].append(err_detail)
-                             yield {"event_type": "thought", "data": create_thought_event("Error", "Dependency Installation Exception", err_detail)}
-                exec_result: E2BResult = sandbox.notebook.exec_cell(llm_response.code, timeout=120)
-            elif llm_response.type == "html":
-                escaped_html_code = repr(llm_response.code)
-                python_code_for_html = f"with open('index.html', 'w', encoding='utf-8') as f: f.write({escaped_html_code})"
-                exec_result: E2BResult = sandbox.notebook.exec_cell(python_code_for_html, timeout=30)
-            else:
-                err_detail = f"Unsupported code type for E2B: {llm_response.type}"
-                e2b_updates["e2b_stderr"].append(err_detail)
-                yield {"event_type": "thought", "data": create_thought_event("Error", "Unsupported E2B Code Type", err_detail)}
-                e2b_updates["current_goal"] = "E2B execution failed (Unsupported code type). Reflecting again."
-                return e2b_updates
-
-            e2b_updates["e2b_stdout"] = [log.line for log in exec_result.logs.stdout]
-            e2b_updates["e2b_stderr"].extend([log.line for log in exec_result.logs.stderr])
-
-            if exec_result.error:
-                err_val = f"Name: {exec_result.error.name}\nValue: {exec_result.error.value}\nTraceback: {exec_result.error.traceback_raw}"
-                e2b_updates["e2b_stderr"].append(err_val) # Also add to stderr state
-                yield {"event_type": "thought", "data": create_thought_event("Error", "E2B Code Execution Error", err_val)}
-
-            processed_artifacts_data = []
-            artifact_names = []
-            for art in exec_result.artifacts:
-                artifact_names.append(art.name)
-                try:
-                    content_bytes = art.download_as_bytes()
-                    if art.name.lower().endswith((".png", ".jpg", ".jpeg", ".gif")):
-                        mimetype = "image/png" # Default, can be refined
-                        if art.name.lower().endswith(".jpg") or art.name.lower().endswith(".jpeg"):
-                            mimetype = "image/jpeg"
-                        elif art.name.lower().endswith(".gif"):
-                            mimetype = "image/gif"
-
-                        content_base64 = base64.b64encode(content_bytes).decode('utf-8')
-                        processed_artifacts_data.append({
-                            "name": art.name,
-                            "type": "image",
-                            "data_uri": f"data:{mimetype};base64,{content_base64}"
-                        })
-                    elif art.name.lower().endswith(".html"):
-                        # Assuming download_as_string() exists or decode from bytes
-                        try:
-                            html_content = art.download_as_string()
-                        except AttributeError: # Fallback if download_as_string is not available
-                            html_content = content_bytes.decode('utf-8', errors='replace')
-                        processed_artifacts_data.append({
-                            "name": art.name,
-                            "type": "html_content",
-                            "content": html_content
-                        })
-                    else:
-                        processed_artifacts_data.append({"name": art.name, "type": "other"})
-                except Exception as art_e:
-                    err_detail = f"Error processing artifact {art.name}: {str(art_e)}"
+        yield {"event_type": "thought", "data": create_thought_event("Action", "Executing Code in Sandbox", f"Running {llm_code_type} code in E2B sandbox.")}
+        # Sandbox execution block
+        try:
+            with CodeInterpreter(api_key=os.getenv("E2B_API_KEY")) as sandbox:
+                if llm_code_type == "python":
+                    if llm_dependencies:
+                        deps_str = ", ".join(llm_dependencies)
+                        yield {"event_type": "thought", "data": create_thought_event("Action", "Installing Dependencies", f"Installing: {deps_str}")}
+                        for dep_idx, dep in enumerate(llm_dependencies):
+                            try:
+                                install_result = sandbox.notebook.install_pip_package(dep)
+                                if not install_result.success:
+                                    err_detail = f"Failed to install dependency {dep_idx+1}/{len(llm_dependencies)}: {dep}. Error: {install_result.error}"
+                                    e2b_updates["e2b_stderr"].append(err_detail)
+                                    yield {"event_type": "thought", "data": create_thought_event("Error", f"Dependency Installation Failed: {dep}", err_detail)}
+                            except Exception as e_dep:
+                                 err_detail = f"Exception during dependency installation {dep}: {str(e_dep)}"
+                                 e2b_updates["e2b_stderr"].append(err_detail)
+                                 yield {"event_type": "thought", "data": create_thought_event("Error", f"Dependency Installation Exception: {dep}", err_detail)}
+                    exec_result: E2BResult = sandbox.notebook.exec_cell(llm_code, timeout=120) # Configurable timeout
+                elif llm_code_type == "html":
+                    escaped_html_code = repr(llm_code)
+                    python_code_for_html = f"with open('index.html', 'w', encoding='utf-8') as f: f.write({escaped_html_code})"
+                    exec_result: E2BResult = sandbox.notebook.exec_cell(python_code_for_html, timeout=30) # Configurable timeout
+                else:
+                    err_detail = f"Unsupported code type for E2B: {llm_code_type}"
                     e2b_updates["e2b_stderr"].append(err_detail)
-                    yield {"event_type": "thought", "data": create_thought_event("Error", "Artifact Processing Error", err_detail)}
+                    yield {"event_type": "thought", "data": create_thought_event("Error", "Unsupported E2B Code Type", err_detail)}
+                    e2b_updates["current_goal"] = "E2B execution failed (Unsupported code type). Reflecting again."
+                    return e2b_updates
 
-            e2b_updates["e2b_artifacts_data"] = processed_artifacts_data
+                e2b_updates["e2b_stdout"] = [log.line for log in exec_result.logs.stdout]
+                e2b_updates["e2b_stderr"].extend([log.line for log in exec_result.logs.stderr])
 
-            analysis_details_list = [
-                f"Stdout lines: {len(e2b_updates['e2b_stdout'])}",
-                f"Stderr lines: {len(e2b_updates['e2b_stderr'])}",
-                f"Generated artifacts: {', '.join(artifact_names) if artifact_names else 'None'}"
-            ]
-            yield {"event_type": "thought", "data": create_thought_event("Analysis", "E2B Execution Outcome", analysis_details_list)}
+                if exec_result.error:
+                    err_val = f"Name: {exec_result.error.name}\nValue: {exec_result.error.value}\nTraceback: {exec_result.error.traceback_raw}"
+                    e2b_updates["e2b_stderr"].append(err_val) # Also add to stderr state
+                    yield {"event_type": "thought", "data": create_thought_event("Error", "E2B Code Execution Error", err_val)}
 
-    except Exception as e:
-        err_msg = f"Critical error in E2B node: {str(e)}" # Ensure this is a string
-        print(err_msg) # For backend logging
+                processed_artifacts_data = []
+                artifact_names = []
+                for art_idx, art in enumerate(exec_result.artifacts):
+                    artifact_names.append(art.name)
+                    try:
+                        content_bytes = art.download_as_bytes()
+                        if art.name.lower().endswith((".png", ".jpg", ".jpeg", ".gif")):
+                            mimetype = "image/png" # Default, can be refined
+                            if art.name.lower().endswith((".jpg", ".jpeg")): mimetype = "image/jpeg"
+                            elif art.name.lower().endswith(".gif"): mimetype = "image/gif"
+                            content_base64 = base64.b64encode(content_bytes).decode('utf-8')
+                            processed_artifacts_data.append({
+                                "name": art.name, "type": "image",
+                                "data_uri": f"data:{mimetype};base64,{content_base64}"})
+                        elif art.name.lower().endswith(".html"):
+                            try: html_content = art.download_as_string()
+                            except AttributeError: html_content = content_bytes.decode('utf-8', errors='replace')
+                            processed_artifacts_data.append({
+                                "name": art.name, "type": "html_content", "content": html_content})
+                        else: # Generic artifact
+                            processed_artifacts_data.append({"name": art.name, "type": "other", "size_bytes": len(content_bytes)})
+                    except Exception as art_e:
+                        err_detail = f"Error processing artifact {art_idx+1}: {art.name}: {str(art_e)}"
+                        e2b_updates["e2b_stderr"].append(err_detail)
+                        yield {"event_type": "thought", "data": create_thought_event("Error", f"Artifact Processing Error: {art.name}", err_detail)}
+                e2b_updates["e2b_artifacts_data"] = processed_artifacts_data
+                analysis_details_list = [
+                    f"Stdout lines: {len(e2b_updates['e2b_stdout'])}",
+                    f"Stderr lines: {len(e2b_updates['e2b_stderr'])}",
+                    f"Generated artifacts: {', '.join(artifact_names) if artifact_names else 'None'}"
+                ]
+                yield {"event_type": "thought", "data": create_thought_event("Analysis", "E2B Execution Outcome", analysis_details_list)}
+        except Exception as sandbox_e: # Catch errors from CodeInterpreter context or setup
+            err_msg = f"Error during E2B sandbox operation: {str(sandbox_e)}"
+            print(err_msg)
+            e2b_updates["e2b_stderr"].append(err_msg)
+            yield {"event_type": "thought", "data": create_thought_event("Error", "E2B Sandbox Operation Failure", err_msg)}
+
+
+    except Exception as e: # Catch errors from LLM call or other logic at the start of the node
+        err_msg = f"Critical error in E2B node (before sandbox execution or during LLM call): {str(e)}"
+        print(err_msg)
         e2b_updates["e2b_stderr"].append(err_msg)
         yield {"event_type": "thought", "data": create_thought_event("Error", "E2B Node Processing Failure", err_msg)}
 
@@ -737,89 +808,81 @@ def finalize_answer(state: OverallState, config: RunnableConfig) -> dict: # Retu
     yield {"event_type": "thought", "data": create_thought_event("Strategy", "Synthesizing Final Answer", "Preparing to generate the final comprehensive answer based on all gathered and processed information.")}
 
     configurable = Configuration.from_runnable_config(config)
-    # Ensure answer_model is used, not reasoning_model from state which might be outdated or from reflection
-    answer_model_name = configurable.answer_model
+    answer_model_name = configurable.answer_model # Ensure answer_model is used
 
-    # Format the prompt
-    current_date = get_current_date()
-    formatted_prompt = answer_instructions.format(
-        current_date=current_date,
-        research_topic=get_research_topic(state["messages"]),
-        summaries="\n---\n\n".join(state["web_research_result"]),
-    )
+    # Safely access all necessary state fields with defaults
+    research_topic = get_research_topic(state.get("messages", []))
+    web_research_results = state.get("web_research_result", [])
+    summaries_str = "\n---\n\n".join(web_research_results) if web_research_results else "No web research information was gathered."
 
-    # init Reasoning Model, default to Gemini 2.5 Flash
-    llm = ChatGoogleGenerativeAI(
-        model=answer_model_name,
-        temperature=0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
-    )
-    result = llm.invoke(formatted_prompt)
-
-    # Prepare E2B related strings for the prompt
-    e2b_generated_code_str = state.get("e2b_generated_code") or "No code was executed or available."
-    e2b_stdout_str = "\n".join(state.get("e2b_stdout", [])) if state.get("e2b_stdout") else "Not available."
-    e2b_stderr_str = "\n".join(state.get("e2b_stderr", [])) if state.get("e2b_stderr") else "Not available."
+    e2b_generated_code_str = state.get("e2b_generated_code") or "No code was generated or executed."
+    e2b_stdout_list = state.get("e2b_stdout", [])
+    e2b_stdout_str = "\n".join(e2b_stdout_list) if e2b_stdout_list else "No standard output from code execution."
+    e2b_stderr_list = state.get("e2b_stderr", [])
+    e2b_stderr_str = "\n".join(e2b_stderr_list) if e2b_stderr_list else "No standard error from code execution."
 
     e2b_artifacts_data_list = state.get("e2b_artifacts_data", [])
     artifact_names_for_prompt = [art.get("name", "unknown_artifact") for art in e2b_artifacts_data_list]
-    e2b_artifacts_str = ", ".join(artifact_names_for_prompt) if artifact_names_for_prompt else "No artifacts produced."
+    e2b_artifacts_str = ", ".join(artifact_names_for_prompt) if artifact_names_for_prompt else "No artifacts were produced by code execution."
 
-    # Format the prompt
     current_date = get_current_date()
-    formatted_prompt = answer_instructions.format(
-        current_date=current_date,
-        research_topic=get_research_topic(state["messages"]),
-        summaries="\n---\n\n".join(state.get("web_research_result", [])), # Ensure default if None
-        e2b_generated_code=e2b_generated_code_str,
-        e2b_stdout_str=e2b_stdout_str,
-        e2b_stderr_str=e2b_stderr_str,
-        e2b_artifacts_str=e2b_artifacts_str,
-    )
 
-    llm = ChatGoogleGenerativeAI(
-        model=answer_model_name,
-        temperature=0,
-        max_retries=2,
-        api_key=os.getenv("GEMINI_API_KEY"),
-    )
-    result_content = llm.invoke(formatted_prompt).content
+    # Prepare a default error message if generation fails
+    final_content = "Could not generate a final answer due to an error."
+    final_sources_list = []
 
-    yield {"event_type": "thought", "data": create_thought_event("Analysis", "Final Answer Generated", "The comprehensive answer has been composed.")}
+    try:
+        # Format the prompt with safely accessed data
+        formatted_prompt = answer_instructions.format(
+            current_date=current_date,
+            research_topic=research_topic,
+            summaries=summaries_str,
+            e2b_generated_code=e2b_generated_code_str,
+            e2b_stdout_str=e2b_stdout_str,
+            e2b_stderr_str=e2b_stderr_str,
+            e2b_artifacts_str=e2b_artifacts_str,
+        )
 
-    # The LLM's response (result_content) should already contain the [1], [2] markers.
-    # We don't need to replace them with full URLs in the text anymore.
-    processed_content = result_content
+        llm = ChatGoogleGenerativeAI(
+            model=answer_model_name,
+            temperature=0, # Typically 0 for final answer generation
+            max_retries=2,
+            api_key=os.getenv("GEMINI_API_KEY"),
+        )
+        llm_response = llm.invoke(formatted_prompt)
+        final_content = llm_response.content if hasattr(llm_response, 'content') else "LLM response was empty or malformed."
 
-    # Deduplicate sources_gathered based on the 'url' field, as the same URL might have been
-    # processed multiple times by web_research if cited by different queries.
-    # The 'short_url' (which is now the citation marker like '[1]') should be consistent
-    # due to the global url_to_citation_marker map.
-    all_gathered_sources = state.get("sources_gathered", [])
-    unique_sources_dict: Dict[str, Dict[str, Any]] = {}
-    for source in all_gathered_sources:
-        if source.get("url") not in unique_sources_dict:
-            unique_sources_dict[source["url"]] = source
+        yield {"event_type": "thought", "data": create_thought_event("Analysis", "Final Answer Generated", "The comprehensive answer has been composed.")}
 
-    final_sources_list = list(unique_sources_dict.values())
+        # Deduplicate and sort sources
+        all_gathered_sources = state.get("sources_gathered", [])
+        unique_sources_dict: Dict[str, Dict[str, Any]] = {}
+        for source in all_gathered_sources:
+            # Ensure source is a dict and has a 'url' key
+            if isinstance(source, dict) and source.get("url"):
+                if source["url"] not in unique_sources_dict:
+                    unique_sources_dict[source["url"]] = source
 
-    # Sort sources by their citation marker numerically, e.g., [1], [2], [10]
-    # This requires extracting the number from the marker string.
-    def get_marker_number(src):
-        marker = src.get("citation_marker", "[99999]") # Use a large number for sorting if marker is missing
-        try:
-            return int(marker.strip("[]"))
-        except ValueError:
-            return 99999 # Fallback for malformed markers
+        final_sources_list = list(unique_sources_dict.values())
 
-    final_sources_list.sort(key=get_marker_number)
+        def get_marker_number(src):
+            marker = src.get("citation_marker", "[99999]")
+            try: return int(marker.strip("[]"))
+            except ValueError: return 99999
+        final_sources_list.sort(key=get_marker_number)
+
+    except Exception as e:
+        error_message = f"Error in finalize_answer: {str(e)}"
+        print(error_message)
+        yield {"event_type": "thought", "data": create_thought_event("Error", "Final Answer Generation Failed", error_message)}
+        # final_content is already set to an error message
+        # final_sources_list will be empty or whatever was processed before error
 
     return {
-        "messages": [AIMessage(content=processed_content)],
-        "sources_gathered": final_sources_list,
-        "e2b_artifacts_data": e2b_artifacts_data_list, # Ensure this is passed out
-        "current_goal": "Process complete. Final answer provided."
+        "messages": [AIMessage(content=final_content)],
+        "sources_gathered": final_sources_list, # Return processed list
+        "e2b_artifacts_data": e2b_artifacts_data_list, # Pass through existing artifacts
+        "current_goal": "Process complete. Final answer provided (or error occurred)."
     }
 
 

@@ -1,21 +1,14 @@
+import React, { useState, useEffect, useRef } from "react";
 import { InputForm } from "./InputForm";
+import CustomTextEffect from "./CustomTextEffect"; // Assuming this is in the same directory
 
-// Updated WelcomeScreenProps for Step 4
 interface WelcomeScreenProps {
-  // handleSubmit will be simplified after App.tsx's handleSubmit is updated in Step 5
-  // For now, keep its signature as App.tsx expects, but we know InputForm will call it differently soon.
-  // Or, more correctly, InputForm's onSubmit prop type should match what it actually calls.
-  // Let's assume App.tsx's handleSubmit is already (inputValue: string, researchMode: string) from Step 2.
-  // And InputForm's onSubmit is (inputValue: string) from Step 3.
-  // So WelcomeScreen needs to adapt the call or App.tsx needs to provide a compatible handleSubmit.
-  // The instruction says: "App.tsx`'s `handleSubmit` function (passed to `WelcomeScreen` and then to `InputForm`'s `onSubmit` prop,
-  // potentially renamed) should be `(inputValue: string) => { /* ... access researchMode from App.tsx's state ... make API call ... */ }`."
-  // This means WelcomeScreen will receive this simplified handleSubmit.
-  handleSubmit: (submittedInputValue: string) => void; // This is what InputForm will call
+  handleSubmit: (submittedInputValue: string) => void;
   onCancel: () => void;
   isLoading: boolean;
-  researchMode: string; // from App.tsx
-  onResearchModeChange: (mode: string) => void; // from App.tsx
+  researchMode: string;
+  onResearchModeChange: (mode: string) => void;
+  hasHistory: boolean;
 }
 
 export const WelcomeScreen: React.FC<WelcomeScreenProps> = ({
@@ -24,28 +17,75 @@ export const WelcomeScreen: React.FC<WelcomeScreenProps> = ({
   isLoading,
   researchMode,
   onResearchModeChange,
-}) => (
-  <div className="flex flex-col items-center justify-center text-center px-4 flex-1 w-full max-w-2xl mx-auto"> {/* Reduced max-width for focus */}
-    <div className="mb-8"> {/* Increased bottom margin */}
-      <h1 className="text-4xl md:text-5xl font-semibold text-neutral-100 mb-2"> {/* Slightly smaller h1 */}
-        Research Agent
-      </h1>
-      <p className="text-lg md:text-xl text-neutral-400">
-        What would you like to explore today?
+  hasHistory,
+}) => {
+  const [isFocused, setIsFocused] = useState(false);
+  const novahTitleRef = useRef<HTMLHeadingElement>(null);
+
+  useEffect(() => {
+    const handleMouseMove = (event: MouseEvent) => {
+      if (novahTitleRef.current) {
+        const rect = novahTitleRef.current.getBoundingClientRect();
+        const x = event.clientX - rect.left;
+        const y = event.clientY - rect.top;
+        novahTitleRef.current.style.setProperty("--mouse-x", `${x}px`);
+        novahTitleRef.current.style.setProperty("--mouse-y", `${y}px`);
+      }
+    };
+
+    const currentRef = novahTitleRef.current;
+    if (currentRef) {
+      currentRef.addEventListener("mousemove", handleMouseMove);
+    }
+
+    // Set focus to the Novah title initially for the glow effect
+    setIsFocused(true);
+
+    return () => {
+      if (currentRef) {
+        currentRef.removeEventListener("mousemove", handleMouseMove);
+      }
+    };
+  }, []);
+
+  return (
+    <div className="flex flex-col items-center justify-center text-center px-4 flex-1 w-full max-w-3xl mx-auto animate-fadeInUp">
+      <div
+        className="mb-10 relative" // Increased bottom margin
+        onMouseEnter={() => setIsFocused(true)}
+        onMouseLeave={() => setIsFocused(false)}
+        tabIndex={-1} // Make it focusable
+        ref={novahTitleRef}
+      >
+        <CustomTextEffect
+          text="Novah"
+          baseClass={`novah-title text-7xl md:text-8xl font-bold ${isFocused ? 'focused' : ''}`}
+          charClass="novah-char"
+          animationDelay={100}
+          animationDuration="0.8s"
+          finalClass="tracking-tight" // Example final class for tighter tracking after animation
+        />
+        <CustomTextEffect
+          text="Your Advanced AI Agent"
+          baseClass="text-xl md:text-2xl text-neutral-400 mt-2 animate-fadeInUp animation-delay-700"
+          charClass="inline-block animate-fadeInUp"
+          animationDelay={30} // Faster per char
+          animationDuration="0.5s" // Faster animation
+        />
+      </div>
+      <div className="w-full p-1.5 rounded-xl shadow-2xl bg-neutral-800/60 backdrop-blur-md border border-neutral-700/80">
+        <InputForm
+          onSubmit={handleSubmit}
+          isLoading={isLoading}
+          onCancel={onCancel}
+          hasHistory={hasHistory}
+          researchMode={researchMode}
+          onResearchModeChange={onResearchModeChange}
+        />
+      </div>
+      <p className="text-xs text-neutral-500 mt-10 animate-fadeInUp animation-delay-1500">
+        Powered by Google Gemini & LangGraph.
       </p>
     </div>
-    <div className="w-full p-2 rounded-xl shadow-2xl bg-neutral-800"> {/* Added a subtle background and shadow to InputForm container */}
-      <InputForm
-        onSubmit={handleSubmit}
-        isLoading={isLoading}
-        onCancel={onCancel}
-        hasHistory={false}
-        researchMode={researchMode}
-        onResearchModeChange={onResearchModeChange}
-      />
-    </div>
-    <p className="text-xs text-neutral-500 mt-8"> {/* Increased top margin */}
-      Powered by Google Gemini & LangGraph
-    </p>
-  </div>
-);
+  );
+};

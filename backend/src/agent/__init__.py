@@ -1,2 +1,3 @@
-# Remove circular import - graph will be imported directly where needed
-__all__ = []
+from agent.graph import graph
+
+__all__ = ["graph"]

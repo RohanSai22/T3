@@ -1,20 +1,21 @@
 import { useStream } from "@langchain/langgraph-sdk/react";
 import type { Message } from "@langchain/langgraph-sdk";
 import { useState, useEffect, useRef, useCallback } from "react";
-import { ProcessedEvent } from "@/components/ActivityTimeline";
+import { ProcessedEvent } from "@/components/ActivityTimeline"; // Will be removed if ChatMessagesView is fully removed or refactored
 import { WelcomeScreen } from "@/components/WelcomeScreen";
-import { ChatMessagesView } from "@/components/ChatMessagesView";
-import { ThoughtStreamPanel } from "@/components/ThoughtStreamPanel"; // Import ThoughtStreamPanel
+// import { ChatMessagesView } from "@/components/ChatMessagesView"; // Replaced by ChatLayout
+import { ChatLayout } from "@/components/ChatLayout"; // Import ChatLayout
+// import { ThoughtStreamPanel } from "@/components/ThoughtStreamPanel"; // ThoughtStreamPanel is now part of ChatLayout's internal structure for this view
 import { CognitiveBlockData, ThoughtType, Source, E2BArtifact } from "@/types"; // Import types
-import { Button } from "@/components/ui/button"; // For mock button
+import { Button } from "@/components/ui/button"; // For mock button - can be removed if not used
 
 export default function App() {
-  const [processedEventsTimeline, setProcessedEventsTimeline] = useState<
-    ProcessedEvent[]
-  >([]);
-  const [historicalActivities, setHistoricalActivities] = useState<
-    Record<string, ProcessedEvent[]>
-  >({});
+  // const [processedEventsTimeline, setProcessedEventsTimeline] = useState< // This state might be managed differently or passed to ChatLayout if still needed
+  //   ProcessedEvent[]
+  // >([]);
+  // const [historicalActivities, setHistoricalActivities] = useState< // This state might be managed differently or passed to ChatLayout if still needed
+  //   Record<string, ProcessedEvent[]>
+  // >({});
   const [researchMode, setResearchMode] = useState<string>(() => {
     return localStorage.getItem("researchMode") || "Normal";
   });
@@ -268,62 +269,48 @@ export default function App() {
   };
   // --- End Temporary Mock Data Generation ---
 
-  return (
-    <div className="flex h-screen bg-neutral-800 text-neutral-100 font-sans antialiased">
-      {/* Thought Stream Panel (Example Layout: Left Side) */}
-      <aside className="w-1/3 h-full border-r border-neutral-700 p-2 hidden md:flex md:flex-col gap-2">
-        {" "}
-        {/* Added gap */}
-        <ThoughtStreamPanel
-          thoughts={thoughtStream}
-          isLoadingNextThought={isThinking}
-          currentGoal={currentGoal}
-          sources={currentSources} // Pass currentSources
-        />
-        {/* Temporary button for mock data - can be removed later */}
-        <Button
-          onClick={addMockThought}
-          className="mt-auto bg-blue-600 hover:bg-blue-700 text-white"
-        >
-          Add Mock Thought
-        </Button>
-      </aside>
+  // Remove mock data button if not needed for new layout
+  // const mockButton = (
+  //   <Button
+  //     onClick={addMockThought}
+  //     className="fixed bottom-4 right-4 bg-blue-600 hover:bg-blue-700 text-white z-50"
+  //   >
+  //     Add Mock Thought
+  //   </Button>
+  // );
 
-      {/* Main Chat/Input Area (Example Layout: Right Side) */}
-      <main className="flex-1 flex flex-col overflow-hidden max-w-4xl mx-auto w-full md:w-2/3">
-        {" "}
-        {/* Ensure this takes up remaining space */}
-        <div
-          className={`flex-1 overflow-y-auto ${
-            thread.messages.length === 0 ? "flex" : ""
-          }`}
-        >
-          {thread.messages.length === 0 ? (
-            <WelcomeScreen
-              handleSubmit={handleSubmit}
-              isLoading={thread.isLoading}
-              onCancel={handleCancel}
-              researchMode={researchMode}
-              onResearchModeChange={handleResearchModeChange}
-              // WelcomeScreen doesn't need sources directly, InputForm within it doesn't use them
-            />
-          ) : (
-            <ChatMessagesView
-              messages={thread.messages}
-              isLoading={thread.isLoading}
-              scrollAreaRef={scrollAreaRef}
-              onSubmit={handleSubmit}
-              onCancel={handleCancel}
-              researchMode={researchMode}
-              onResearchModeChange={handleResearchModeChange}
-              sources={currentSources}
-              e2bArtifacts={e2bArtifacts} // Pass e2bArtifacts
-              liveActivityEvents={processedEventsTimeline}
-              historicalActivities={historicalActivities}
-            />
-          )}
-        </div>
-      </main>
+  return (
+    // The main div will now conditionally render WelcomeScreen or ChatLayout
+    // ChatLayout itself will manage its internal two-panel structure.
+    <div className="h-screen bg-neutral-900 text-neutral-100 font-sans antialiased">
+      {thread.messages.length === 0 ? (
+        <WelcomeScreen
+          handleSubmit={handleSubmit}
+          isLoading={thread.isLoading}
+          onCancel={handleCancel}
+          researchMode={researchMode}
+          onResearchModeChange={handleResearchModeChange}
+          hasHistory={false} // No history on welcome screen
+        />
+      ) : (
+        <ChatLayout
+          messages={thread.messages}
+          isLoading={thread.isLoading}
+          onSubmit={handleSubmit}
+          onCancel={handleCancel}
+          researchMode={researchMode}
+          onResearchModeChange={handleResearchModeChange}
+          currentSources={currentSources}
+          e2bArtifacts={e2bArtifacts}
+          thoughtStream={thoughtStream}
+          isThinking={isThinking}
+          currentGoal={currentGoal}
+        />
+      )}
+      {/* {mockButton} {/* You can add this back if you still need the mock button for testing */}
     </div>
   );
 }
+// Ensure historicalActivities and processedEventsTimeline are handled if ChatLayout needs them,
+// or remove if their functionality is superseded or integrated differently.
+// For now, they are commented out from App.tsx state.
